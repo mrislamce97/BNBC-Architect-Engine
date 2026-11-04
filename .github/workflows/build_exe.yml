@@ -1,0 +1,35 @@
+name: Compile BNBC Architect Engine EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+
+    - name: Setup Python 3.11 Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Compile to Standalone Windowed EXE
+      run: |
+        pyinstaller --noconfirm --onedir --windowed --name "BNBC_Architect_Engine_v2.0" bnbc_architect_engine.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: BNBC_Architect_Engine_Windows_x64
+        path: dist/BNBC_Architect_Engine_v2.0/
