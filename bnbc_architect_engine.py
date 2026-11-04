@@ -7,7 +7,7 @@ from ezdxf.enums import TextEntityAlignment
 
 try:
     from shapely.geometry import Polygon
-    from shapely.affinity import translate
+    from shapely.affinity import translate, scale
 except ImportError:
     raise ImportError("Shapely is required: pip install shapely")
 
@@ -28,12 +28,14 @@ class BNBCArchitectEngineApp:
     def __init__(self, root):
         self.root = root
         self.root.title("BNBC 2022 - Professional Architectural CAD Plan Engine")
-        self.root.geometry("740x940")
+        self.root.geometry("740x980")
         self.root.resizable(False, False)
 
         self.input_dxf_path = tk.StringVar()
         self.selected_layer = tk.StringVar(value="0")
+        self.cad_unit_mode = tk.StringVar(value="Auto-Detect (Inches / Feet)")
         self.detected_polylines = []
+        self.scale_factor = 1.0  # 1.0 if coordinates are feet; 1/12.0 if inches
         self.auto_unit_mode = tk.BooleanVar(value=True)
 
         self._build_ui()
@@ -41,8 +43,8 @@ class BNBCArchitectEngineApp:
     def _build_ui(self):
         pad = {'padx': 10, 'pady': 3}
 
-        # 1. DXF Boundary Selection
-        cad_frame = ttk.LabelFrame(self.root, text=" 1. CAD Property Boundary Line (FPS Units) ")
+        # 1. DXF Boundary Selection & Unit Verification
+        cad_frame = ttk.LabelFrame(self.root, text=" 1. CAD Boundary Polyline & Unit Normalizer ")
         cad_frame.pack(fill="x", **pad)
 
         f_row = ttk.Frame(cad_frame)
@@ -52,10 +54,21 @@ class BNBCArchitectEngineApp:
 
         l_row = ttk.Frame(cad_frame)
         l_row.pack(fill="x", padx=6, pady=4)
-        ttk.Label(l_row, text="Property Line Layer:").pack(side="left")
-        self.layer_combo = ttk.Combobox(l_row, textvariable=self.selected_layer, state="readonly", width=25)
-        self.layer_combo.pack(side="left", padx=10)
+        ttk.Label(l_row, text="Boundary Layer:").pack(side="left")
+        self.layer_combo = ttk.Combobox(l_row, textvariable=self.selected_layer, state="readonly", width=20)
+        self.layer_combo.pack(side="left", padx=5)
         self.layer_combo.bind("<<ComboboxSelected>>", self._on_layer_selected)
+
+        ttk.Label(l_row, text="CAD Drawing Unit:").pack(side="left", padx=(10, 2))
+        self.unit_combo = ttk.Combobox(
+            l_row,
+            textvariable=self.cad_unit_mode,
+            values=["Auto-Detect (Inches / Feet)", "Force Inches (Divide by 12)", "Force Feet (No Scale)"],
+            state="readonly",
+            width=23
+        )
+        self.unit_combo.pack(side="left")
+        self.unit_combo.bind("<<ComboboxSelected>>", self._on_unit_override)
 
         self.poly_info_lbl = ttk.Label(cad_frame, text="Load DXF file containing the closed property boundary polyline.", foreground="gray")
         self.poly_info_lbl.pack(anchor="w", padx=6, pady=2)
@@ -162,7 +175,7 @@ class BNBCArchitectEngineApp:
             "• Doors: Real 3\" wooden frame jambs, 1.5\" door shutter, 90-degree swing arc.\n"
             "• Windows: Exterior sill double-line glass panels with wall reveal.\n"
             "• Columns: Single structural monolithic RCC column at shared unit boundaries.\n"
-            "• High-Contrast Screen Colors: NO Color 7 (White) and NO Color 2 (Yellow)."
+            "• Automatic Unit Normalizer: Correctly scales DXFs drawn in Inches to Decimal Feet."
         )
         ttk.Label(spec_frame, text=spec_text, justify="left").pack(anchor="w", padx=8, pady=4)
 
@@ -180,7 +193,7 @@ class BNBCArchitectEngineApp:
 
     def _update_column_info(self, event=None):
         cw, cd = self._get_column_dimensions()
-        self.col_info_lbl.configure(text=f"Current Column: {int(cw*12)}\" x {int(cd*12)}\" (Single Shared RCC)")
+        self.col_info_lbl.configure(text=f"Current Column: {int(cw*12)}\" x {int(cd*12)}\" (Shared Single RCC Column)")
 
     def _get_column_dimensions(self):
         sel = self.story_selector.get()
@@ -214,6 +227,12 @@ class BNBCArchitectEngineApp:
         except Exception as e:
             messagebox.showerror("CAD Import Error", f"Cannot parse DXF file:\n{str(e)}")
 
+    def _on_unit_override(self, event=None):
+        path = self.input_dxf_path.get()
+        if path and os.path.exists(path):
+            doc = ezdxf.readfile(path)
+            self._load_boundary(doc, self.selected_layer.get())
+
     def _on_layer_selected(self, event=None):
         path = self.input_dxf_path.get()
         if not path or not os.path.exists(path):
@@ -238,20 +257,41 @@ class BNBCArchitectEngineApp:
             self.detected_polylines = []
             return
 
-        self.detected_polylines = polylines
-        poly = Polygon(polylines[0])
-        bounds = poly.bounds
+        raw_poly = Polygon(polylines[0])
+        raw_bounds = raw_poly.bounds
+        raw_w = raw_bounds[2] - raw_bounds[0]
+        raw_d = raw_bounds[3] - raw_bounds[1]
+        raw_area = raw_poly.area
+
+        # Intelligent Unit Normalization:
+        # Standard residential urban plots in Bangladesh are between 1.5 Katha and 20 Katha (1,000 to 15,000 SFT).
+        # If raw_area > 30,000, the CAD file was drawn in INCHES.
+        unit_mode = self.cad_unit_mode.get()
+        if "Inches" in unit_mode or ("Auto-Detect" in unit_mode and raw_area > 30000.0):
+            self.scale_factor = 1.0 / 12.0
+            actual_area = raw_area / 144.0
+            unit_tag = "Auto-Normalized: CAD Inches -> Feet"
+        else:
+            self.scale_factor = 1.0
+            actual_area = raw_area
+            unit_tag = "CAD Units: Feet"
+
+        # Apply scaling to the polygon vertices
+        norm_pts = [(p[0] * self.scale_factor, p[1] * self.scale_factor) for p in polylines[0]]
+        self.detected_polylines = [norm_pts]
+
+        norm_poly = Polygon(norm_pts)
+        bounds = norm_poly.bounds
         w = bounds[2] - bounds[0]
         d = bounds[3] - bounds[1]
-        area = poly.area
-        katha = area / 720.0
+        katha = actual_area / 720.0
+
         self.poly_info_lbl.configure(
-            text=f"Boundary Loaded: {w:.1f}' x {d:.1f}' | Land Area: {area:.1f} SFT ({katha:.2f} Katha)",
+            text=f"Boundary: {w:.1f}' x {d:.1f}' | Land Area: {actual_area:.1f} SFT ({katha:.2f} Katha) | [{unit_tag}]",
             foreground="#005500"
         )
 
     def _setup_layers(self, doc):
-        """Palette without Color 7 (White) or Color 2 (Yellow) for white background visibility."""
         palette = [
             ("A-PROP-LINE", 1),       # Red: Property line
             ("A-SETBACK-LINE", 8),    # Slate Gray: Setback limits
@@ -271,33 +311,19 @@ class BNBCArchitectEngineApp:
             if name not in doc.layers:
                 doc.layers.add(name=name, color=col)
 
-    # -------------------------------------------------------------
-    # REAL ARCHITECTURAL DRAWING PRIMITIVES
-    # -------------------------------------------------------------
     def _draw_double_wall_h(self, msp, x1, x2, y_center, thickness=5.0/12.0, layer="A-WALL-INTR"):
-        """Draws a true 5" horizontal masonry wall with two parallel lines."""
         ht = thickness / 2.0
         msp.add_line((x1, y_center - ht), (x2, y_center - ht), dxfattribs={"layer": layer})
         msp.add_line((x1, y_center + ht), (x2, y_center + ht), dxfattribs={"layer": layer})
 
     def _draw_double_wall_v(self, msp, y1, y2, x_center, thickness=5.0/12.0, layer="A-WALL-INTR"):
-        """Draws a true 5" vertical masonry wall with two parallel lines."""
         ht = thickness / 2.0
         msp.add_line((x_center - ht, y1), (x_center - ht, y2), dxfattribs={"layer": layer})
         msp.add_line((x_center + ht, y1), (x_center + ht, y2), dxfattribs={"layer": layer})
 
     def _draw_door(self, msp, hinge_x, hinge_y, width=3.0, orientation="NE"):
-        """
-        Draws a real architectural door:
-        - 3" wooden door jamb
-        - 1.5" door leaf panel
-        - 90-degree quarter-circle swing arc
-        """
-        jamb = 0.25  # 3"
-        leaf_thk = 0.125  # 1.5"
-
-        # Swing arcs and leaf orientation
-        if orientation == "NE":  # Hinge at (hinge_x, hinge_y), swings toward positive Y and X
+        leaf_thk = 0.125
+        if orientation == "NE":
             msp.add_line((hinge_x, hinge_y), (hinge_x, hinge_y + width), dxfattribs={"layer": "A-DOOR"})
             msp.add_line((hinge_x + leaf_thk, hinge_y), (hinge_x + leaf_thk, hinge_y + width), dxfattribs={"layer": "A-DOOR"})
             msp.add_line((hinge_x, hinge_y + width), (hinge_x + leaf_thk, hinge_y + width), dxfattribs={"layer": "A-DOOR"})
@@ -315,23 +341,15 @@ class BNBCArchitectEngineApp:
             msp.add_arc((hinge_x, hinge_y), radius=width, start_angle=180, end_angle=270, dxfattribs={"layer": "A-DOOR"})
 
     def _draw_window(self, msp, p1, p2, is_horizontal=True):
-        """
-        Draws a real architectural window:
-        - Outer wall cut sill lines
-        - Inner double glass slider lines (spaced 2" apart)
-        """
         wall_thk = 5.0 / 12.0
         ht = wall_thk / 2.0
         x1, y1 = p1
         x2, y2 = p2
 
         if is_horizontal:
-            # Wall cut line
             y_mid = (y1 + y2) / 2.0
-            # Double glass pane
             msp.add_line((x1, y_mid - 0.08), (x2, y_mid - 0.08), dxfattribs={"layer": "A-WIND"})
             msp.add_line((x1, y_mid + 0.08), (x2, y_mid + 0.08), dxfattribs={"layer": "A-WIND"})
-            # Window jamb end caps
             msp.add_line((x1, y_mid - ht), (x1, y_mid + ht), dxfattribs={"layer": "A-WIND"})
             msp.add_line((x2, y_mid - ht), (x2, y_mid + ht), dxfattribs={"layer": "A-WIND"})
         else:
@@ -342,14 +360,12 @@ class BNBCArchitectEngineApp:
             msp.add_line((x_mid - ht, y2), (x_mid + ht, y2), dxfattribs={"layer": "A-WIND"})
 
     def _draw_single_shared_column(self, msp, cx, cy, col_w, col_d):
-        """Draws one single monolithic RCC column on layer S-COLUMN with interior concrete hatch cross."""
         hw = col_w / 2.0
         hd = col_d / 2.0
         p1 = (cx - hw, cy - hd)
         p2 = (cx + hw, cy + hd)
         pts = [p1, (p2[0], p1[1]), p2, (p1[0], p2[1]), p1]
         msp.add_lwpolyline(pts, dxfattribs={"layer": "S-COLUMN"})
-        # Structural concrete cross
         msp.add_line(p1, p2, dxfattribs={"layer": "S-COLUMN"})
         msp.add_line((p1[0], p2[1]), (p2[0], p1[1]), dxfattribs={"layer": "S-COLUMN"})
 
@@ -375,10 +391,10 @@ class BNBCArchitectEngineApp:
             return 4
 
     def _generate_single_plan(self, msp, origin_x, origin_y, prop_poly, sf, sb, sl, sr, var_idx):
-        wall_thk = 5.0 / 12.0  # 5" brick wall = 0.4167 ft
+        wall_thk = 5.0 / 12.0
         col_w, col_d = self._get_column_dimensions()
 
-        # 1. Transform Boundary Line
+        # Translate the normalized polygon
         trans_poly = translate(prop_poly, xoff=origin_x, yoff=origin_y)
         msp.add_lwpolyline(list(trans_poly.exterior.coords), dxfattribs={"layer": "A-PROP-LINE"})
 
@@ -386,7 +402,6 @@ class BNBCArchitectEngineApp:
         plot_w = maxx - minx
         plot_d = maxy - miny
 
-        # Legal Buildable footprint derived from setbacks
         bx1 = minx + sl
         by1 = miny + sf
         bx2 = maxx - sr
@@ -397,9 +412,9 @@ class BNBCArchitectEngineApp:
         buildable_area = bw * bd
 
         if bw < 26.0 or bd < 30.0:
-            raise ValueError(f"Buildable space {bw:.1f}' x {bd:.1f}' is too constrained for construction.")
+            raise ValueError(f"Buildable space {bw:.1f}' x {bd:.1f}' is too constrained after setback deduction.")
 
-        # 2. Draw Setback Indicator Lines & High-Contrast Annotations
+        # Setback lines and labels
         msp.add_line((bx1, miny), (bx1, maxy), dxfattribs={"layer": "A-SETBACK-LINE"})
         msp.add_text(f"LEFT SETBACK: {to_feet_inches(sl)}", height=0.45, dxfattribs={"layer": "A-SETBACK-DIMS"}).set_placement(
             (minx + sl/2.0, miny + plot_d/2.0), align=TextEntityAlignment.MIDDLE_CENTER
@@ -420,37 +435,32 @@ class BNBCArchitectEngineApp:
             (minx + plot_w/2.0, maxy - sb/2.0), align=TextEntityAlignment.MIDDLE_CENTER
         )
 
-        # 3. Exterior Envelope: TRUE 5" DOUBLE WALL
-        # Outer face
+        # Exterior 5" Double Walls
         pts_out = [(bx1, by1), (bx2, by1), (bx2, by2), (bx1, by2), (bx1, by1)]
         msp.add_lwpolyline(pts_out, dxfattribs={"layer": "A-WALL-EXTR"})
-        # Inner face (offset exactly 5")
         pts_in = [(bx1 + wall_thk, by1 + wall_thk), (bx2 - wall_thk, by1 + wall_thk),
                   (bx2 - wall_thk, by2 - wall_thk), (bx1 + wall_thk, by2 - wall_thk),
                   (bx1 + wall_thk, by1 + wall_thk)]
         msp.add_lwpolyline(pts_in, dxfattribs={"layer": "A-WALL-EXTR"})
 
-        # 4. SINGLE STRUCTURAL COLUMN MATRIX (NO DUPLICATE COLUMNS AT EDGES OR JOINTS)
-        # 4 columns along width, 4 along depth = 16 clean monolithic columns
+        # Shared Column Matrix
         cols_x = [bx1 + col_w/2.0, bx1 + bw * 0.33, bx1 + bw * 0.66, bx2 - col_w/2.0]
         cols_y = [by1 + col_d/2.0, by1 + bd * 0.33, by1 + bd * 0.66, by2 - col_d/2.0]
 
-        # Draw structural grid lines
         for gx in cols_x:
             msp.add_line((gx, by1 - 3.0), (gx, by2 + 3.0), dxfattribs={"layer": "S-GRID"})
         for gy in cols_y:
             msp.add_line((bx1 - 3.0, gy), (bx2 + 3.0, gy), dxfattribs={"layer": "S-GRID"})
 
-        # Place exactly ONE monolithic column per grid intersection
         for gx in cols_x:
             for gy in cols_y:
                 self._draw_single_shared_column(msp, gx, gy, col_w, col_d)
 
-        # 5. CORE CIRCULATION: STAIRWELL & OPTIONAL LIFT
-        landing_w = 3.75  # 3'-9" BNBC landing
-        flight_run = 7.5  # 9 Treads @ 10" = 90" = 7'-6" run
-        stair_depth = landing_w + flight_run + landing_w  # 15'-0"
-        stair_width = 8.0  # 3'-9" + 3'-9" + 6" gap = 8'-0"
+        # Stair & Core
+        landing_w = 3.75
+        flight_run = 7.5
+        stair_depth = landing_w + flight_run + landing_w
+        stair_width = 8.0
 
         core_x1 = bx1 + (bw - stair_width) / 2.0
         core_x2 = core_x1 + stair_width
@@ -458,23 +468,18 @@ class BNBCArchitectEngineApp:
         core_y2 = core_y1 + stair_depth
         mid_cx = (core_x1 + core_x2) / 2.0
 
-        # Draw Stair Double Wall (5" enclosure)
         self._draw_double_wall_v(msp, core_y1, core_y2, core_x1)
         self._draw_double_wall_v(msp, core_y1, core_y2, core_x2)
         self._draw_double_wall_h(msp, core_x1, core_x2, core_y2)
 
-        # Stair Treads, Handrails and Risers
         flight_y_start = core_y1 + landing_w
         flight_y_end = flight_y_start + flight_run
 
-        # Central handrail / well gap
         msp.add_line((mid_cx, flight_y_start), (mid_cx, flight_y_end), dxfattribs={"layer": "A-CIRC-STAIR"})
-        # 10 Risers per flight (9 intermediate lines)
         for i in range(10):
             ty = flight_y_start + i * (10.0 / 12.0)
             msp.add_line((core_x1, ty), (core_x2, ty), dxfattribs={"layer": "A-CIRC-STAIR"})
 
-        # Stair Direction Arrow
         msp.add_line((core_x1 + 1.8, flight_y_start + 0.5), (core_x1 + 1.8, flight_y_end - 0.5), dxfattribs={"layer": "A-CIRC-STAIR"})
         msp.add_line((core_x1 + 1.5, flight_y_end - 1.2), (core_x1 + 1.8, flight_y_end - 0.5), dxfattribs={"layer": "A-CIRC-STAIR"})
         msp.add_line((core_x1 + 2.1, flight_y_end - 1.2), (core_x1 + 1.8, flight_y_end - 0.5), dxfattribs={"layer": "A-CIRC-STAIR"})
@@ -489,7 +494,7 @@ class BNBCArchitectEngineApp:
             (mid_cx, core_y1 + landing_w/2.0), align=TextEntityAlignment.MIDDLE_CENTER
         )
 
-        # 6. OPTIONAL LIFT HANDLING (Yes or No)
+        # Optional Lift
         has_lift = (self.has_lift.get() == "Yes")
         lift_safe_lobby = 5.0
         pax = self.lift_pax.get()
@@ -503,19 +508,17 @@ class BNBCArchitectEngineApp:
                 ly2 = core_y1 - lift_safe_lobby
                 ly1 = ly2 - lift_box
 
-                # 5'-0" Lift Safety Lobby
                 pts_lobby = [(core_x1, ly2), (core_x2, ly2), (core_x2, core_y1), (core_x1, core_y1), (core_x1, ly2)]
                 msp.add_lwpolyline(pts_lobby, dxfattribs={"layer": "A-LOBBY-SAFE"})
                 msp.add_text("5'-0\" LIFT SAFETY LOBBY", height=0.42, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
                     (mid_cx, core_y1 - lift_safe_lobby/2.0), align=TextEntityAlignment.MIDDLE_CENTER
                 )
-            else:  # Side-by-Side
+            else:
                 lx1 = core_x2 + wall_thk
                 lx2 = lx1 + lift_box
                 ly1 = core_y1 + landing_w
                 ly2 = ly1 + lift_box
 
-            # Draw 8" RCC Lift Shaft Wall
             lift_rcc = 8.0 / 12.0
             pts_lift_out = [(lx1, ly1), (lx2, ly1), (lx2, ly2), (lx1, ly2), (lx1, ly1)]
             pts_lift_in = [(lx1 + lift_rcc, ly1 + lift_rcc), (lx2 - lift_rcc, ly1 + lift_rcc),
@@ -523,17 +526,15 @@ class BNBCArchitectEngineApp:
                            (lx1 + lift_rcc, ly1 + lift_rcc)]
             msp.add_lwpolyline(pts_lift_out, dxfattribs={"layer": "A-CIRC-LIFT"})
             msp.add_lwpolyline(pts_lift_in, dxfattribs={"layer": "A-CIRC-LIFT"})
-            # Lift Cross & Door
             msp.add_line((lx1 + lift_rcc, ly1 + lift_rcc), (lx2 - lift_rcc, ly2 - lift_rcc), dxfattribs={"layer": "A-CIRC-LIFT"})
             msp.add_line((lx1 + lift_rcc, ly2 - lift_rcc), (lx2 - lift_rcc, ly1 + lift_rcc), dxfattribs={"layer": "A-CIRC-LIFT"})
             msp.add_text(f"LIFT\n({pax[:5]})", height=0.45, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
                 ((lx1 + lx2)/2.0, (ly1 + ly2)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
             )
 
-        # 7. UNIT PARTITIONS WITH TRUE 5" DOUBLE WALLS, DOORS, AND WINDOWS
+        # Plan Subdivision
         unit_count = self._determine_unit_count(buildable_area)
 
-        # Common Central Dividing Wall for Double Unit (ONE SHARED WALL, NO DUPLICATE)
         if unit_count == 2:
             mid_wall_x = bx1 + bw / 2.0
             self._draw_double_wall_v(msp, by1 + wall_thk, core_y1, mid_wall_x)
@@ -544,27 +545,19 @@ class BNBCArchitectEngineApp:
                 uw = ux2 - ux1
                 is_left = (uname == "UNIT-A")
 
-                # Master Bedroom Wall (Rear)
                 mb_y = by2 - bd * 0.35
                 self._draw_double_wall_h(msp, ux1 + wall_thk, ux2 - wall_thk, mb_y)
 
-                # Bedroom 2 Wall (Front)
                 b2_y = by1 + bd * 0.30
                 self._draw_double_wall_h(msp, ux1 + wall_thk, ux2 - wall_thk, b2_y)
 
-                # Attached Bathroom Partition
                 bath_w = 4.5
-                bath_d = 7.0
                 if is_left:
                     ab_x = ux1 + bath_w
                     self._draw_double_wall_v(msp, mb_y, by2 - wall_thk, ab_x)
-                    # Door into Master Bath
                     self._draw_door(msp, ab_x, mb_y + 0.5, width=2.33, orientation="NW")
-                    # Window in Master Bath
                     self._draw_window(msp, (ux1, by2 - 3.5), (ux1, by2 - 1.5), is_horizontal=False)
-                    # Master Bed Windows (Exterior Wall)
                     self._draw_window(msp, (ab_x + 2.0, by2), (ab_x + 6.0, by2), is_horizontal=True)
-                    # Master Bedroom Entry Door
                     self._draw_door(msp, ux2 - 3.5, mb_y, width=3.0, orientation="SE")
                 else:
                     ab_x = ux2 - bath_w
@@ -574,7 +567,6 @@ class BNBCArchitectEngineApp:
                     self._draw_window(msp, (ux1 + 2.0, by2), (ab_x - 2.0, by2), is_horizontal=True)
                     self._draw_door(msp, ux1 + 0.5, mb_y, width=3.0, orientation="SW")
 
-                # Kitchen & Common Toilet Partition
                 k_w = 6.5
                 k_d = 8.0
                 if is_left:
@@ -590,20 +582,17 @@ class BNBCArchitectEngineApp:
                     self._draw_door(msp, kx - 0.5, b2_y + k_d, width=2.5, orientation="SE")
                     self._draw_window(msp, (ux2, b2_y + 2.0), (ux2, b2_y + 6.0), is_horizontal=False)
 
-                # Unit Main Entry Door from Lobby
                 if is_left:
                     self._draw_door(msp, core_x1, core_y1 + 1.0, width=3.33, orientation="NW")
                 else:
                     self._draw_door(msp, core_x2, core_y1 + 1.0, width=3.33, orientation="NE")
 
-                # Bedroom-2 Front Windows and Door
                 self._draw_window(msp, (ux1 + 2.5, by1), (ux1 + 6.5, by1), is_horizontal=True)
                 if is_left:
                     self._draw_door(msp, ux2 - 3.5, b2_y, width=3.0, orientation="NE")
                 else:
                     self._draw_door(msp, ux1 + 0.5, b2_y, width=3.0, orientation="NW")
 
-                # Room Annotations with Areas
                 mb_area = (uw - bath_w) * (bd * 0.35)
                 msp.add_text(f"{uname}\nMASTER BED\n12'-6\" x 11'-6\"\n({mb_area:.0f} SFT)", height=0.55, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
                     ((ux1 + ux2)/2.0, by2 - (bd * 0.35)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
@@ -620,9 +609,7 @@ class BNBCArchitectEngineApp:
                     ((ux1 + ux2)/2.0, by1 + (bd * 0.30)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
                 )
 
-                # Living / Dining Space Annotations
                 if var_idx == 1:
-                    # Option 1: Distinct Living and Dining
                     div_y = (b2_y + mb_y) / 2.0
                     self._draw_double_wall_h(msp, ux1 + wall_thk, ux2 - wall_thk, div_y)
                     msp.add_text(f"{uname}\nFORMAL LIVING\n12' x 11'", height=0.55, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
@@ -632,17 +619,14 @@ class BNBCArchitectEngineApp:
                         ((ux1 + ux2)/2.0, (div_y + mb_y)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
                     )
                 elif var_idx == 2:
-                    # Option 2: Drawing cum Dining Open Space
                     msp.add_text(f"{uname}\nDRAWING CUM DINING\n(OPEN CONCEPT: 240 SFT)", height=0.60, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
                         ((ux1 + ux2)/2.0, (b2_y + mb_y)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
                     )
                 else:
-                    # Option 3: Kitchen-Dining Suite
                     msp.add_text(f"{uname}\nLIVING & FAMILY SUITE", height=0.60, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
                         ((ux1 + ux2)/2.0, (b2_y + mb_y)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
                     )
 
-        # Single Unit and 3/4 Units Architectural Wall Partitioning
         elif unit_count == 1:
             msp.add_text("EXECUTIVE SINGLE UNIT LUXURY SUITE", height=0.9, dxfattribs={"layer": "A-TEXT-ROOM"}).set_placement(
                 ((bx1 + bx2)/2.0, (by1 + by2)/2.0), align=TextEntityAlignment.MIDDLE_CENTER
@@ -656,7 +640,7 @@ class BNBCArchitectEngineApp:
                 (mid_x, mid_y), align=TextEntityAlignment.MIDDLE_CENTER
             )
 
-        # 8. TITLE BLOCK
+        # Title Block
         opt_names = {
             1: f"OPTION 01: ADAPTIVE {unit_count}-UNIT ARCHITECTURAL PLAN (DISTINCT LIVING & DINING)",
             2: f"OPTION 02: ADAPTIVE {unit_count}-UNIT ARCHITECTURAL PLAN (COMMON DRAWING CUM DINING)",
@@ -721,6 +705,7 @@ class BNBCArchitectEngineApp:
                 f"• Real Architectural Doors (3\" Frame + Leaf + 90-deg Arc)\n"
                 f"• Real Architectural Windows (Sill + Double Glass)\n"
                 f"• Single Monolithic Shared RCC Columns (No duplicates)\n"
+                f"• Normalized Plot Area: {poly.area:.1f} SFT ({poly.area/720.0:.2f} Katha)\n"
                 f"• Lift: {'Included with 5ft Safety Buffer' if self.has_lift.get() == 'Yes' else 'Disabled/Not Required'}\n"
                 f"• Stair: 10' Height, 20 Risers @ 6\", 10\" Treads, 3'-9\" Landing\n"
                 f"• Screen Palette: Clean on White Background (No White/Yellow lines)\n\n"
